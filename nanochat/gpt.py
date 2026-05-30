@@ -40,12 +40,24 @@ class GPTConfig:
 
 
 def norm(x):
+    # RMS Norm stands for Root Mean Square Normalization.
+    # It is a simplified version of Layer Normalization.
+    # It is used to normalize the input to the attention layer.
     return F.rms_norm(x, (x.size(-1),)) # note that this will run in bf16, seems ok
 
 class Linear(nn.Linear):
-    """nn.Linear that casts weights to match input dtype in forward.
+    """
+    nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
-    but matmuls run in the activation dtype (typically bf16 from embeddings)."""
+    but matmuls run in the activation dtype (typically bf16 from embeddings).
+    
+    Formula: y = x * W^T + b
+    - x (Input Data): A 3D tensor of shape (batch, sequence_length, embedding_dim), e.g. (32, 512, 768)
+    - W (Layer Weights): A 2D tensor of shape (out_dim, in_dim), e.g. (768, 768)
+    
+    PyTorch dynamically broadcasts the 3D tensor against the 2D weight matrix:
+    (32, 512, 768) * (768, 768)^T + b -> (32, 512, 768)
+    """
     def forward(self, x):
         return F.linear(x, self.weight.to(dtype=x.dtype))
 
