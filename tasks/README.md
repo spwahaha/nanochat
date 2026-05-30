@@ -3,6 +3,6 @@
 This directory contains standard evaluative benchmarks which test the capabilities of the model.
 
 ## Highlighted Benchmarks:
-- **`gsm8k.py`**: Evaluation for logic and grade-school math problems.
-- **`mmlu.py`**: Tests on college-level multiple-choice questions across subjects like history and law.
-- **`humaneval.py` / `arc.py`**: Evaluation tools for coding abilities and science reasoning.
+- **`gsm8k.py`** ([`tasks/gsm8k.py`](./gsm8k.py)): Evaluation for logic and grade-school math problems.
+- **`mmlu.py`** ([`tasks/mmlu.py`](./mmlu.py)): Tests on college-level multiple-choice questions across subjects like history and law.
+- **`humaneval.py`** ([`tasks/humaneval.py`](./humaneval.py)) / **`arc.py`** ([`tasks/arc.py`](./arc.py)): Evaluation tools for coding abilities and science reasoning.
