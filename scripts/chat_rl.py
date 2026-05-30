@@ -63,6 +63,10 @@ user_config = vars(args).copy()
 
 # Init compute/precision
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+# ddp: boolean flag indicating if we are running in a multi-GPU distributed setting
+# ddp_rank: the global ID of this specific GPU across all connected machines (0 to ddp_world_size-1)
+# ddp_local_rank: the local ID of this GPU on the current physical machine
+# ddp_world_size: the total number of all GPUs participating in the training job
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
 master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
 

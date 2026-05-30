@@ -101,6 +101,9 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
         # Download the content as bytes
         print(f"Downloading {url}...")
         with urllib.request.urlopen(url) as response:
+            # WARNING: This reads the entire file into memory before saving!
+            # If the URL is a massive file (like a multi-GB dataset or model weights),
+            # this will definitely cause an Out-Of-Memory (OOM) error.
             content = response.read() # bytes
 
         # Write to local file

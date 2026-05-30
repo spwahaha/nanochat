@@ -50,7 +50,44 @@ class GSM8K(Task):
         return len(self.ds)
 
     def get_example(self, index):
-        """ Get a single problem from the dataset. """
+        """ 
+        Get a single problem from the dataset. 
+        
+        Example transformation in this function:
+        Raw question: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?
+        Raw answer: Natalia sold 48/2 = <<48/2=24>>24 clips in May.\nNatalia sold 48+24 = <<48+24=72>>72 clips altogether in April and May.\n#### 72
+        
+        1. Splitting out the math tools:
+        parts = [
+            "Natalia sold 48/2 = ", 
+            "<<48/2=24>>", 
+            "24 clips in May.\\nNatalia sold 48+24 = ",
+            "<<48+24=72>>",
+            "72 clips altogether in April and May.\\n#### 72"
+        ]
+        
+        2. Compiling into model-ready conversation dictionary:
+        conversation = {
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": "Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did Natalia sell altogether in April and May?"
+                },
+                {
+                    "role": "assistant", 
+                    "content": [
+                        {"type": "text", "text": "Natalia sold 48/2 = "},
+                        {"type": "python", "text": "48/2"},
+                        {"type": "python_output", "text": "24"},
+                        {"type": "text", "text": "24 clips in May.\\nNatalia sold 48+24 = "},
+                        {"type": "python", "text": "48+24"},
+                        {"type": "python_output", "text": "72"},
+                        {"type": "text", "text": "72 clips altogether in April and May.\\n#### 72"}
+                    ]
+                }
+            ]
+        }
+        """
         row = self.ds[index]
         question = row['question'] # string of the question prompt
         answer = row['answer'] # string of the full solution and the answer after #### marker
