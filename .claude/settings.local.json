@@ -1,4 +1,8 @@
 {
+  "attribution": {
+    "commit": "Co-Authored-By: spwahaha <spwahaha@gmail.com>",
+    "pr": "🤖 Generated with [Claude Code](https://claude.com/claude-code)"
+  },
   "permissions": {
     "allow": [
       "Bash(git add *)",
