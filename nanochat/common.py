@@ -151,6 +151,10 @@ def is_ddp_initialized() -> bool:
     return dist.is_available() and dist.is_initialized()
 
 def get_dist_info():
+    """
+    Returns a tuple (is_ddp, ddp_rank, ddp_local_rank, ddp_world_size).
+    ddp: Distributed Data Parallel
+    """
     if is_ddp_requested():
         # We rely on torchrun's env to decide if we SHOULD init.
         # (Initialization itself happens in compute init.)

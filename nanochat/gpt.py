@@ -47,6 +47,7 @@ def norm(x):
 
 class Linear(nn.Linear):
     """
+    Linear(in_features, out_features, bias=True, device=None, dtype=None)
     nn.Linear that casts weights to match input dtype in forward.
     Replaces autocast: master weights stay fp32 for optimizer precision,
     but matmuls run in the activation dtype (typically bf16 from embeddings).
@@ -78,6 +79,11 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.layer_idx = layer_idx
+        # Grouped-Query Attention (GQA).
+        # Q heads:    0  1  2  3  4  5  6  7  8  9  10 11
+        #             │  │  │  │  │  │  │  │  │  │  │  │
+        # KV groups:  └──┴──┴──┘  └──┴──┴──┘  └──┴──┴──┘
+        #             head 0      head 1      head 2     → 4 KV heads total
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
         self.n_embd = config.n_embd
@@ -93,6 +99,9 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size, kv_cache):
         B, T, C = x.size()
+        # x shape: (batch_size, sequence_length, embedding_dim)
+        #           ↓            ↓                 ↓
+        #           B            T                 C
 
         # Project the input to get queries, keys, and values
         # Shape: (B, T, H, D) - FA3's native layout, no transpose needed!
@@ -117,6 +126,7 @@ class CausalSelfAttention(nn.Module):
         # window_size is (left, right) tuple: (N, 0) for causal, (-1, 0) for full context
         if kv_cache is None:
             # Training: causal attention with optional sliding window
+            # Causal -> Causal masking
             y = flash_attn.flash_attn_func(q, k, v, causal=True, window_size=window_size)
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
@@ -133,6 +143,14 @@ class CausalSelfAttention(nn.Module):
                 kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
+        # Before (output of Flash Attention)
+        # y shape: (B, T, n_head, head_dim)  =  (B, 2048, 6, 128)
+        # Each token has 6 separate head vectors, each 128-dimensional.
+
+        # After
+        # y = y.contiguous().view(B, T, -1)
+        # y shape: (B, T, n_head * head_dim)  =  (B, 2048, 768)
+
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -141,10 +159,15 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
+        # c_fc: fully-connected (expand)
+        # c_proj: projection (project back)
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
 
     def forward(self, x):
+        # x shape: (batch_size, sequence_length, embedding_dim)
+        #           ↓            ↓                 ↓
+        #           B            T                 C
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
@@ -204,6 +227,8 @@ class GPT(nn.Module):
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
+        # During training, sequence_len (2048) would be enough. Every batch is exactly 2048 tokens.
+        # The 10× is for inference, where sequences can grow beyond the training length:
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
@@ -397,7 +422,7 @@ class GPT(nn.Module):
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
         assert len(list(self.parameters())) == len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params) + len(smear_params)
 
-        # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
+        # Scale the LR (Learning Rate) for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print0(f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}")
 
@@ -444,12 +469,46 @@ class GPT(nn.Module):
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
+            # Smear: mix previous token's embedding into current position (cheap bigram info)
+            #
+            # During training, the full sequence of T tokens is available, so we use a fast
+            # parallel slice to mix each token with its predecessor all at once.
+            #
+            #   x shape: (B, T, 768)
+            #
+            # Splitting:
+            #   x[:, 1:]   →  positions 1 to T-1           (B, T-1, 768)  ← these get smeared
+            #   x[:, :-1]  →  positions 0 to T-2            (B, T-1, 768)  ← their predecessors
+            #   gate       →  3·σ(Linear₂₄→₁(x[:, 1:, :24]))  (B, T-1, 1)  ← per-position blend weight
+            #
+            # Position 0 has no previous token, so it stays unchanged.
+            # Every other position p mixes in a gated portion of position p-1:
+            #
+            #   x_new[0] = x[0]                              (no predecessor)
+            #   x_new[1] = x[1] + gate[1] · x[0]             ("dog"  + bit of "the")
+            #   x_new[2] = x[2] + gate[2] · x[1]             ("chased" + bit of "dog")
+            #   ...
+            #   x_new[p] = x[p] + gate[p] · x[p-1]
+            #
+            # Then cat the unchanged first token with the smeared rest:
+            #   x = cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            #
+            # This gives the model cheap bigram information at the very first layer,
+            # so it immediately knows "dog follows the" without needing attention to
+            # discover that pattern.
             assert T > 1, "Training forward pass should have T > 1"
             gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(self.smear_gate(x[:, 1:, :24]))
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
-            x_pre_smear = kv_cache.prev_embedding
+            # x[:, -1:, :]
+            #   │   │   │
+            #   │   │   └── all embedding dimensions (768)
+            #   │   │
+            #   │   └── only the LAST token (keeps dim with -1: = slice of size 1)
+            #   │
+            #   └── all batches (typically B=1 during inference)
+
             kv_cache.prev_embedding = x[:, -1:, :]
             if T > 1:
                 # Prefill: apply smear to positions 1+, same as training
@@ -479,6 +538,7 @@ class GPT(nn.Module):
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+        # ... (Ellipsis) means "all preceding dimensions." It's a wildcard for "everything before this point."
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
@@ -486,6 +546,35 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
+            # logits.view(-1, logits.size(-1))
+            #             │    │
+            #             │    └── last dim = vocab_size  (number of columns after flatten)
+            #             │
+            #             └── infer the first dim  (B × T, however many rows that is)
+            # Config: vocab_size=5, B=2, T=3
+            # After model forward (simplified logits):
+            #       logits (2, 3, 5)                    targets (2, 3)
+            # ┌───────────────────────────────────┐   ┌──────────┐
+            # │ batch 0                           │   │          │
+            # │   pos0: [2.0, 0.1,-1.0,-2.0,0.5]  │   │ 0, 3, 1  │
+            # │   pos1: [0.5, 1.0, 0.0, 3.0,0.2]  │   │          │
+            # │   pos2: [-1.,-0.5, 2.0, 0.1,0.8]  │   │          │
+            # ├───────────────────────────────────┤   ├──────────┤
+            # │ batch 1                           │   │          │
+            # │   pos0: [0.3,-1.0, 1.5, 0.0,0.2]  │   │ 2, -1,-1 │
+            # │   pos1: [0.1, 0.8,-2.0, 1.0,0.3]  │   │          │ ← pad: logits exist but ignored
+            # │   pos2: [1.0, 0.2, 0.1,-1.0,2.5]  │   │          │ ← pad: logits exist but ignored
+            # └───────────────────────────────────┘   └──────────┘
+            #               Flatten
+            #    logits.view(-1, 5)          targets.view(-1)
+            # ┌───────────────────────────┐   ┌────┐
+            # │ b0p0: 2.0  0.1 -1 -2  0.5 │   │  0 │  ← real
+            # │ b0p1: 0.5  1.0  0  3  0.2 │   │  3 │  ← real
+            # │ b0p2:-1.0 -0.5  2  0.1 0.8│   │  1 │  ← real
+            # │ b1p0: 0.3 -1.0  1.5 0  0.2│   │  2 │  ← real
+            # │ b1p1: 0.1  0.8 -2  1  0.3 │   │ -1 │  ← ignored!
+            # │ b1p2: 1.0  0.2  0.1 -1 2.5│   │ -1 │  ← ignored!
+            # └───────────────────────────┘   └────┘
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
