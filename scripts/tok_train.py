@@ -80,7 +80,12 @@ token_bytes = []
 for token_id in range(vocab_size):
     token_str = token_strings[token_id] # the Python string representation of this token
     if token_str in special_set:
-        token_bytes.append(0) # special characters are not counted
+        # Special tokens (e.g. <|bos|>, <|user_start|>) are structural protocol markers,
+        # not content. Assigning 0 bytes excludes them from BPB so the metric measures
+        # content compression quality, not protocol fidelity. They're also excluded from
+        # SFT training loss via the mask (render_conversation assigns mask=0 to all
+        # special tokens except assistant-end and tool-call markers).
+        token_bytes.append(0)
     else:
         id_bytes = len(token_str.encode("utf-8")) # number of bytes that make up this token
         token_bytes.append(id_bytes)

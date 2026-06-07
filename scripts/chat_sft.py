@@ -116,6 +116,10 @@ for name, fallback, source in [
     else:
         print0(f"Using {name}={arg_val}")
 
+# Keep an uncompiled reference for eval tasks that produce variable-length inputs
+# (e.g., ChatCORE autoregressive generation). torch.compile recompiles every time it
+# sees a new input shape, so we use orig_model for those and the compiled model for
+# training and BPB eval, which use fixed (B, T) shapes from the SFT data loader.
 orig_model = model
 model = torch.compile(model, dynamic=False)
 depth = model.config.n_layer
@@ -161,6 +165,22 @@ for group in optimizer.param_groups:
     group["initial_lr"] = group["lr"]
 
 # SFT data mixture and DataLoader
+# The training "mixture" works by flattening all task datasets into one big shuffled
+# list. Each row is seen exactly once per pass through the list, so a task's sampling
+# probability is simply its row count divided by the total.
+#
+# Since MMLU (100K) and GSM8K (8K) are small relative to SmolTalk (460K), they would
+# barely be seen without inflating their presence. Passing them multiple times via
+# the "*[... for _ in range(N)]" pattern duplicates the SAME data N times in the
+# shuffled stream — it's NOT "train for N epochs" in the traditional sense, it's
+# "repeat this dataset N times in the mixture to increase its sampling weight."
+# This trades data redundancy for ensuring scarce-but-important tasks (math, MC
+# reasoning, tool use) aren't drowned out by abundant general chat.
+#
+# Training proportions are designed intentionally; validation uses `stop` to limit
+# MMLU and GSM8K rows so their proportions roughly match the training mixture (see
+# the inline comments). Without `stop`, MMLU's 14K test rows would dominate the val
+# BPB calculation, making a model that's weak at MMLU appear worse than it is.
 identity_conversations_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
 train_tasks = [
     SmolTalk(split="train"), # 460K rows of general conversations
@@ -344,6 +364,12 @@ while True:
         last_step = bool(last_step_tensor.item())
 
     # once in a while: evaluate the val bpb (all ranks participate)
+    # BPB (bits per byte) normalizes loss by the number of UTF-8 bytes each token encodes,
+    # making it a vocab-size-independent metric: models with different tokenizers remain
+    # comparable. Special tokens (e.g. <|bos|>) contribute 0 bytes and are excluded.
+    # We use the compiled model here because the SFT data loader always produces
+    # fixed-shape (B, T) tensors, so torch.compile never needs to recompile.
+    # model.eval() disables dropout etc.; model.train() at the end restores training mode.
     if last_step or (args.eval_every > 0 and step % args.eval_every == 0):
         model.eval()
         val_loader = build_val_loader()
@@ -358,11 +384,15 @@ while True:
             "total_training_time": total_training_time,
             "val/bpb": val_bpb,
         })
-        model.train()
+        model.train()  # restore training mode (model started in train mode; eval temporarily switches it)
 
     # once in a while: estimate the ChatCORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    chatcore_results = {}
+    # ChatCORE is a normalized multi-task benchmark (0 = random, 1 = perfect) spanning
+    # both categorical (ARC, MMLU) and generative (GSM8K, HumanEval, SpellingBee) tasks.
+    # It complements BPB by measuring downstream capabilities that loss alone can't capture.
+    # We use orig_model (uncompiled) here because autoregressive generation produces
+    # variable-length sequences, which would trigger constant recompilation under torch.compile.
+    chatcore_results = {}  # currently unused, reserved for future result aggregation
     if args.chatcore_every > 0 and (last_step or (step > 0 and step % args.chatcore_every == 0)):
         model.eval()
         engine = Engine(orig_model, tokenizer)
@@ -393,7 +423,7 @@ while True:
             "chatcore_cat": chatcore_cat,
             **{f"chatcore/{task_name}": acc for task_name, acc in task_results.items()},
         })
-        model.train()
+        model.train()  # restore training mode after eval
 
     # save checkpoint at the end of the run (all ranks participate so each saves its optimizer shard)
     if last_step:
@@ -426,6 +456,13 @@ while True:
 
     # -------------------------------------------------------------------------
     # single training step
+    # Gradient accumulation: since GPU memory limits per-step batch size, we run
+    # multiple micro-batches (forward + backward) and sum their gradients before
+    # calling optimizer.step(). Dividing loss by grad_accum_steps normalizes the
+    # sum so the effective gradient matches a single large-batch step.
+    # The training loss is per-token mean cross-entropy (not BPB): every non-masked
+    # token contributes equal gradient signal regardless of its byte length. BPB is
+    # only for evaluation, since it normalizes by bytes for vocab-size independence.
     # evaluate the gradient
     synchronize()
     t0 = time.time()
