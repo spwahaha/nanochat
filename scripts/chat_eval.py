@@ -153,6 +153,51 @@ def run_categorical_eval(task_object, tokenizer, model, batch_size, max_problems
     return average
 
 # -----------------------------------------------------------------------------
+# Eval dispatch: two fundamentally different evaluation strategies.
+#
+# CATEGORICAL EVAL (MMLU, ARC-Easy, ARC-Challenge):
+#   The answer is guaranteed to be a single token from a known small set (A/B/C/D).
+#   No generation needed — just run one forward pass and check logits at the answer
+#   position. The prompt ends with <|assistant_start|>, so the model's very next token
+#   prediction is the answer letter. All problems can be batched together (padded to
+#   max length with BOS, pad positions masked by ignore_index).
+#
+#   Example (MMLU):
+#     Prompt:  "...What is the capital of France?\n- Paris=A\n- London=B\n..."
+#              "...Respond only with the letter of the correct answer.\n<|assistant_start|>"
+#     Forward: model(padded_prompt_ids)  →  logits[B, T, V]
+#     Focus:   logits[idx, answer_pos, [A_id, B_id, C_id, D_id]]  →  4 numbers
+#     Answer:  argmax → "B"
+#
+# GENERATIVE EVAL (GSM8K, HumanEval, SpellingBee):
+#   The answer is embedded in free-form text (e.g. "#### 42"). The model must
+#   autoregressively generate the full response, potentially including tool calls.
+#   Extracts the answer with a regex (e.g. /#### (\-?[0-9\.\,]+)/). Supports multiple
+#   samples per problem: if ANY sample is correct, the problem passes.
+#
+#   Example (GSM8K):
+#     Prompt:  "Natalia sold clips to 48 of her friends..."
+#     Generate: engine.generate_batch(prompt, num_samples=N)
+#     Output:  "Natalia sold 48/2 = <<48/2=24>>24 clips...\n#### 72"
+#     Extract: extract_answer(output) → "72"
+#
+#   ┌──────────────────────┬─────────────────────────┬──────────────────────────┐
+#   │                      │ Categorical             │ Generative               │
+#   ├──────────────────────┼─────────────────────────┼──────────────────────────┤
+#   │ Model calls          │ 1 forward pass          │ N autoregressive steps   │
+#   │ Batched?             │ Yes (padded to max_len) │ No (one problem at a    │
+#   │                      │                         │  time, variable length) │
+#   │ Sampling             │ Deterministic argmax    │ temperature, top_k,     │
+#   │                      │                         │ num_samples (pass@k)    │
+#   │ Answer space         │ Exactly 4 known tokens  │ Any sequence of tokens  │
+#   │ Speed                │ Fast (single forward)   │ Slow (full generation)  │
+#   │ Tasks                │ MMLU, ARC               │ GSM8K, HumanEval,       │
+#   │                      │                         │ SpellingBee              │
+#   └──────────────────────┴─────────────────────────┴──────────────────────────┘
+#
+# The split is NOT just about answer extraction — it's about whether we know the
+# answer is a single token from a small fixed set. If yes → logits suffice (categorical).
+# If no → must generate (generative).
 
 def run_chat_eval(task_name, model, tokenizer, engine,
                    batch_size=1, num_samples=1, max_new_tokens=512, temperature=0.0, top_k=50,
