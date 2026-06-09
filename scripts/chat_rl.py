@@ -88,6 +88,17 @@ print0(f"Calculated number of steps: {num_steps}")
 
 @torch.no_grad()
 def get_batch():
+    # GRPO Rollout Generator
+    # ----------------------
+    # This generator processes ONE training question per `next()` call. For that question it:
+    #   1. Generates `num_samples` candidate answers (rollouts) from the current policy π_θ
+    #   2. Scores each rollout with the task's reward function (e.g. 1.0 if correct, 0.0 if wrong)
+    #   3. Computes advantages: A_i = reward_i - mean(rewards)  (relative advantage, GRPO-style)
+    #   4. Yields (sequences, inputs, targets, rewards, advantages) — all of shape (num_samples, T)
+    #
+    # The caller then uses these advantages in the policy gradient loss to:
+    #   - INCREASE the probability of tokens in rollouts with A > 0 (correct / above-average answers)
+    #   - DECREASE the probability of tokens in rollouts with A < 0 (wrong / below-average answers)
     assistant_end = tokenizer.encode_special("<|assistant_end|>") # ok to use this token, it's only for padding and isn't used in the loss.
     rank_indices = range(ddp_rank, len(train_task), ddp_world_size) # each rank is responsible for different examples in the training data
     for example_idx in itertools.cycle(rank_indices):
@@ -221,7 +232,14 @@ assert args.examples_per_step % ddp_world_size == 0, "Desired examples per step 
 examples_per_rank = args.examples_per_step // ddp_world_size # per GPU
 print0(f"Calculated examples per rank: {examples_per_rank}")
 
-# Kick off the training loop
+# Kick off the training loop.
+# `get_batch` is a Python *generator function* (it uses `yield`). Calling it returns a
+# generator object but executes NO code yet. Inside the generator, the outer loop is
+#   `for example_idx in itertools.cycle(rank_indices)`
+# `itertools.cycle` turns the finite per-rank dataset slice into an infinite stream that
+# wraps around automatically after the last example — enabling multi-epoch training without
+# any manual epoch bookkeeping. The generator pauses at each `yield` after processing one
+# training example; the outer loop drives how many examples are consumed via `num_steps`.
 batch_iterator = get_batch()
 for step in range(num_steps):
 
@@ -231,8 +249,14 @@ for step in range(num_steps):
         passk = torch.zeros(args.device_batch_size, device=device) # pass@k for k=1..device_batch_size
         records_iter = run_gsm8k_eval(val_task, tokenizer, engine, num_samples=args.device_batch_size, max_examples=args.eval_examples, temperature=1.0)
         records = list(records_iter) # collect all records
+        
+        # Calculate Pass@k: for each k, sum how many questions were solved (at least one of the 
+        # first k generated answers is correct) across all records. 
+        # - any(o["is_correct"] ... [:k]) returns 1 if at least one of the first k attempts is correct, 0 otherwise.
+        # - sum(...) sums these 1s and 0s to get the count of solved questions.
         for k in range(1, args.device_batch_size + 1):
             passk[k - 1] = sum(any(o["is_correct"] for o in r["outcomes"][:k]) for r in records)
+
         num_records = torch.tensor(len(records), dtype=torch.long, device=device)
         if ddp:
             dist.all_reduce(num_records, op=dist.ReduceOp.SUM)
@@ -251,10 +275,16 @@ for step in range(num_steps):
     sequence_lengths = []
     for example_step in range(examples_per_rank):
         # Get one batch corresponding to one example in the training dataset
+        # `next()` resumes the generator from its last `yield`, advances `itertools.cycle`
+        # to the next example index for this rank, runs rollout + reward computation, and
+        # pauses again at the next `yield` — returning one example's worth of rollouts.
         sequences_all, inputs_all, targets_all, rewards_all, advantages_all = next(batch_iterator)
         # Evaluate the loss and gradients
         model.train() # ensure the model is in train mode
-        # We need one more loop because we can never exceed the device_batch_size
+        # `num_passes` is NOT extra training epochs — it is a GPU memory splitter.
+        # `inputs_all` has `num_samples` rollouts (e.g. 16) but GPU VRAM can only fit
+        # `device_batch_size` (e.g. 4) at once. So we split into `num_passes` (=4) chunks
+        # and accumulate gradients across them. Mathematically identical to one big forward pass.
         assert inputs_all.size(0) % args.device_batch_size == 0
         num_passes = inputs_all.size(0) // args.device_batch_size
         for pass_idx in range(num_passes):
@@ -264,15 +294,38 @@ for step in range(num_steps):
             targets = targets_all[b0:b1]
             rewards = rewards_all[b0:b1]
             advantages = advantages_all[b0:b1]
-            # Calculate log probabilities. Note that the loss calculates NLL = -logp, so we negate
+            # Calculate log probabilities via the sign chain:
+            #   P(token) = 0.3  →  ln(P) = -1.2          (always negative, since P ∈ (0,1))
+            #   model() returns cross_entropy = -ln(P) = +1.2  (always POSITIVE — it's a loss)
+            #   logp = -model() = -(-ln(P)) = ln(P) = -1.2     (negate to recover the raw log-prob)
+            # So logp is ALWAYS NEGATIVE. PyTorch uses natural log (ln, base e), NOT log base 10.
             logp = -model(inputs, targets, loss_reduction='none').view_as(inputs) # (B, T)
-            # Calculate the PG objective. Note that ignore_index=-1 ensures that invalid tokens have loss 0.
+            # Policy Gradient objective: pg_obj = Σ logp(token) × advantage
+            # ignore_index=-1 ensures prompt/pad tokens contribute zero to the sum.
+            #
+            # Sign trace (how the gradient steers correct vs wrong rollouts):
+            #   logp is always negative. The sign of the advantage determines the product's sign:
+            #   - Correct rollout (A > 0): logp×A is NEGATIVE. To maximize pg_obj, optimizer
+            #     pushes A > 0 to be larger and P(token|context) more likely to happen, hence model learns to generate correct rollouts.
+            #   - Wrong rollout   (A < 0): logp×A is POSITIVE. To maximize pg_obj, optimizer
+            #     pushes A < 0 to be less likely to happen (more negative), hence model learns to avoid wrong rollouts.
+            #
+            # Example: correct logp=-0.5, A=+0.5 → contribution=-0.25 (maximize → push A > 0 to be larger and more likely to happen)
+            #          wrong   logp=-0.8, A=-0.5 → contribution=+0.40 (maximize → push A < 0 to be less likely to happen)
             pg_obj = (logp * advantages.unsqueeze(-1)).sum()
             # normalize by the number of valid tokens, number of passes, and examples_per_rank
             num_valid = (targets >= 0).sum().clamp(min=1)
             pg_obj = pg_obj / (num_valid * num_passes * examples_per_rank)
-            # Note, there is no need to add PPO ratio+clip because we are on policy
-            # Finally, formulate the loss that we want to minimize (instead of objective we wish to maximize)
+            # On-policy: rollouts were generated by the CURRENT model (π_θ), so the policy gradient
+            # formula ∇J = E_{x~π_θ}[A·∇logπ_θ(x)] applies directly — no correction needed.
+            # If we reused rollouts from an OLDER policy π_old (off-policy), the gradient would be
+            # biased because the data distribution no longer matches π_θ. PPO fixes this with an
+            # importance-sampling ratio r = π_θ(x)/π_old(x) that re-weights each sample, plus a
+            # clip to prevent the ratio from exploding. Since we generate fresh rollouts every step
+            # and update θ exactly once, π_θ = π_old and r = 1, so PPO's ratio+clip is unnecessary.
+            # loss = -pg_obj: optimizer.step() minimizes loss ↔ maximizes pg_obj.
+            # backward() computes ∂loss/∂θ, then optimizer does θ -= lr × ∂loss/∂θ, which moves θ
+            # in the direction that decreases loss (= increases pg_obj).
             loss = -pg_obj
             loss.backward()
             print0(f"Step {step}/{num_steps} | Example step {example_step} | Pass {pass_idx} | loss: {loss.item():.6f} | Average reward: {rewards.mean().item()}")
